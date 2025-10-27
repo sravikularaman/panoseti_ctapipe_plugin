@@ -1,8 +1,20 @@
-from ctapipe.io import EventSource, DataLevel
-from ctapipe.io.datawriter import ArrayEventContainer
 import numpy as np
 import astropy.units as u
 import pypff
+
+from ctapipe.io import EventSource, DataLevel
+from ctapipe.io.datawriter import ArrayEventContainer
+from ctapipe.reco import Reconstructor
+from ctapipe.instrument import (
+    CameraDescription,
+    CameraGeometry,
+    CameraReadout,
+    OpticsDescription,
+    ReflectorShape,
+    SizeType,
+    SubarrayDescription,
+    TelescopeDescription,
+)
 from .instrument import subarray 
 
 class PanoEventSource(EventSource):
@@ -16,30 +28,67 @@ class PanoEventSource(EventSource):
 
     def _generator(self):
 
-        #-----To modify for two-telescope array-----data? all_timestamps? metadata?
-        
-        pff_file = pypff.io.datapff(str(self.input_url))
-        data, metadata = pff_file.readpff(metadata=True)
+        # List all telescope files
+        module_files = [
+            str(self.input_url).replace("module_1", f"module_{i}") for i in range(1, 3)  # telescope 1 and 2 for now
+            ]
 
-        all_timestamps = []
-        for i in range(4):
-            meta = metadata[f'quabo_{i}']
-            timestamps = meta['tv_sec'] + meta['tv_usec'] * 1e-6
-            #timestamps = timestamps[meta['pkt_num'] != 0] How to take into account packet loss?
-            all_timestamps.append(timestamps)
+        # Read all telescopes' data and metadata
+        telescope_data = []
+        telescope_metadata = []
+
+        for file_path in module_files:
+            pff_file = pypff.io.datapff(file_path)
+            data, metadata = pff_file.readpff(metadata=True)
+            telescope_data.append(data)
+            telescope_metadata.append(metadata)
+
+        # Collect timestamps and filter packet losses for each telescope
+        all_timestamps_by_telescope = []
+        valid_event_mask_by_telescope = [] 
+
+        for metadata in telescope_metadata:
+            quabo_timestamps = []
+            quabo_valid = []
+
+            for i in range(4):
+                meta = metadata[f'quabo_{i}']
+                timestamps = meta['tv_sec'] + meta['tv_usec'] * 1e-6
+
+                # Filter out lost packets
+                wout_pkt_loss = meta['pkt_num'] != 0
+                timestamps = timestamps[wout_pkt_loss]
+
+                quabo_timestamps.append(timestamps)
+                quabo_valid.append(wout_pkt_loss)
+
+            all_timestamps_by_telescope.append(quabo_timestamps)
+
+            valid_events = np.all(np.column_stack(quabo_valid), axis=1)
+            valid_event_mask_by_telescope.append(valid_events)
        
+        # Loop through events
 
-        for i, raw_event in enumerate(data): 
+        num_events = min(len(data) for data in telescope_data) # Better way to loop?
+
+        for i in range(num_events):
+
+            if not all(valid_event_mask_by_telescope[tel][i]
+                       for tel in range(len(valid_event_mask_by_telescope))):
+                continue
             
             event = ArrayEventContainer()
             event.count = i
+            event.trig.tels_with_trigger = []
 
-            for tel_id, raw_event in enumerate(data, start=1):
-                event.r0.tel[tel_id].waveform = np.array(raw_event).T[np.newaxis, :, np.newaxis] #ctapipe wants (n_channels, n_pixels, n_samples) and raw_event is (n_pixels) which is an element from data which is (n_samples, n_pixels)
+            for tel_id, data in enumerate(telescope_data, start=1):
+                raw_event = data[i]
 
-            #Timestamp median of 4 quabo timestamps
-            for tel_id, quabo_timestamps in enumerate(all_timestamps, start=1):
-                # Each quabo_timestamps = list of 4 timestamp arrays (for 4 quabos)
+                event.r0.tel[tel_id].waveform = np.array(raw_event)[np.newaxis, :, np.newaxis]
+                # ctapipe wants (n_channels, n_pixels, n_samples) and raw_event is (n_pixels) which is an element from data which is (n_samples, n_pixels)
+
+                # Median timestamp across quabos
+                quabo_timestamps = all_timestamps_by_telescope[tel_id - 1]
                 if all(len(ts) > i for ts in quabo_timestamps):
                     event_time = np.median([ts[i] for ts in quabo_timestamps])
                     event.trig.tels_with_trigger.append(tel_id)
