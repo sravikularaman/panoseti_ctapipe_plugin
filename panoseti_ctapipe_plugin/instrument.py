@@ -32,7 +32,7 @@ optics = OpticsDescription(
 )
 
 # Telescopes
-telescope_1 = TelescopeDescription(name="Gattini" type="PANOSETI", optics=optics, camera=camera)
+telescope_1 = TelescopeDescription(name="Gattini", type="PANOSETI", optics=optics, camera=camera)
 
 telescope_2 = TelescopeDescription(name="Winter", type="PANOSETI", optics=optics, camera=camera)
 

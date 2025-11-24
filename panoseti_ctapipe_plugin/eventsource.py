@@ -87,10 +87,13 @@ class PanoEventSource(EventSource):
                 event.r0.tel[tel_id].waveform = np.array(raw_event)[np.newaxis, :, np.newaxis]
                 # ctapipe wants (n_channels, n_pixels, n_samples) and raw_event is (n_pixels) which is an element from data which is (n_samples, n_pixels)
 
-                # Median timestamp across quabos
+                # Timestamp across quabos
                 quabo_timestamps = all_timestamps_by_telescope[tel_id - 1]
                 if all(len(ts) > i for ts in quabo_timestamps):
-                    event_time = np.median([ts[i] for ts in quabo_timestamps])
+                    
+                    event_time = np.min([ts[i] for ts in quabo_timestamps])
+                    # event_time = np.median([ts[i] for ts in quabo_timestamps]) # median
+
                     event.trig.tels_with_trigger.append(tel_id)
                     event.trig.tel[tel_id].time = event_time * u.s
 
