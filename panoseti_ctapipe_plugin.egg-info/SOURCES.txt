@@ -1,0 +1,10 @@
+pyproject.toml
+setup.py
+panoseti_ctapipe_plugin.egg-info/PKG-INFO
+panoseti_ctapipe_plugin.egg-info/SOURCES.txt
+panoseti_ctapipe_plugin.egg-info/dependency_links.txt
+panoseti_ctapipe_plugin.egg-info/entry_points.txt
+panoseti_ctapipe_plugin.egg-info/requires.txt
+panoseti_ctapipe_plugin.egg-info/top_level.txt
+src/panoseti_ctapipe_plugin/__init__.py
+src/panoseti_ctapipe_plugin/test_source.py

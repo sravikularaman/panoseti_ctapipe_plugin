@@ -1,0 +1,5 @@
+[ctapipe_io]
+PanoEventSource = panoseti_ctapipe_plugin:PanoEventSource
+
+[ctapipe_reco]
+PanoReconstructor = panoseti_ctapipe_plugin:PanoReconstructor

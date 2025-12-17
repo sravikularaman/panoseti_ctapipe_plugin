@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: panoseti_ctapipe_plugin
+Version: 0.1.0
+Summary: PANOSETI ctapipe plugin
+Author-email: Sruthiranjani Ravikularaman <sruthi@astro.rub.de>
+Requires-Dist: ctapipe
+Requires-Dist: numpy
+Requires-Dist: astropy
+Requires-Dist: pypff
