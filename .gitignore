@@ -6,3 +6,16 @@ __pycache__/
 *.tar.gz
 *.h5
 .ipynb_checkpoints/
+/test_data/
+PLUGIN_NOTES.txt
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+*.pyc
+/notes_backups/
+/Jamie_processing/
+/auto_examples_Jupyter/
+/pypff/
+*.ipynb
+

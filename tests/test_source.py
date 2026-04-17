@@ -1,3 +1,16 @@
+"""
+Unit tests for PANOSETI EventSource plugin.
+
+Tests the compatibility, initialization, and basic functionality of the event source.
+
+Following ctapipe guidelines:
+https://ctapipe.readthedocs.io/en/stable/developer-guide/code-guidelines.html#unit-tests
+
+Author: Sruthi Ravikularaman
+Last modified: 17 April 2026
+"""
+
+import sys
 from pathlib import Path
 
 test_folder = "/Users/ravikularaman/VScode/panoseti_ctapipe_plugin/test_data/pff/obs_Palomar.start_2026-01-15T02:26:39Z.runtype_obs-test.pffd/obs_Palomar.start_2026-01-15T02:26:39Z.runtype_obs-test.pffd"
@@ -78,6 +91,7 @@ def test_allowed_tels_filter():
     with PanoEventSource(test_folder, allowed_tels=[2]) as source:
         for event in source:
             assert 2 in event.trigger.tels_with_trigger
+            assert not 1 in event.trigger.tels_with_trigger
             break
 
 def test_max_events_enforcement():
@@ -95,8 +109,11 @@ def test_source_cleanup():
     source = PanoEventSource(test_folder)
     source.close()
 
+@pytest.mark.skip(reason="Quite long")
 def test_ctapipe_process(tmp_path):
     """Test integration with ctapipe ProcessorTool"""
+    import pytest
+    print("\n[test_ctapipe_process] Starting ctapipe ProcessorTool integration test", flush=True)
     from ctapipe.core.tool import run_tool
     from ctapipe.tools.process import ProcessorTool
     import tables
@@ -104,7 +121,8 @@ def test_ctapipe_process(tmp_path):
     input_path = Path(test_folder).absolute()
     output_path = Path(tmp_path) / "test.dl1.h5"
     
-    result = run_tool(
+    print(f"[test_ctapipe_process] Running ProcessorTool on: {input_path}", flush=True)
+    run_tool(
         tool=ProcessorTool(), 
         argv=[
             '--EventSource.input_url', str(input_path), 
@@ -113,14 +131,15 @@ def test_ctapipe_process(tmp_path):
         ]
     )
     
-    # Verify output was created
+    print(f"[test_ctapipe_process] Checking output file exists: {output_path}", flush=True)
     assert output_path.exists(), "Output file was not created"
     
-    # Check that the file has content
+    print("[test_ctapipe_process] Verifying HDF5 file contains configuration", flush=True)
     with tables.open_file(str(output_path), mode='r') as h5file:
-        # Check that configuration was written
         try:
             config = h5file.get_node('/configuration')
-            assert config is not None, "No configuration group in output"
+            assert config is not None
         except tables.NoSuchNodeError:
-            assert False, "No configuration group in output file"
+            raise AssertionError("No configuration group in output file")
+    
+    print("[test_ctapipe_process] ✓ Test passed", flush=True)

@@ -14,14 +14,14 @@ dependencies = [
 requires = ["setuptools >= 61.0.0"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools]
-package-dir = {"" = "src"}
-
 [tool.setuptools.packages]
-find = {where = ["src"]}
+find = {}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
 
 [project.entry-points.ctapipe_io]
 PanoEventSource = "panoseti_ctapipe_plugin:PanoEventSource"
-
-[project.entry-points.ctapipe_reco]
-PanoReconstructor = "panoseti_ctapipe_plugin:PanoReconstructor"
