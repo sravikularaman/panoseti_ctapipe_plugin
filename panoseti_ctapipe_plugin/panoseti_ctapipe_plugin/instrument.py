@@ -42,19 +42,24 @@ __all__ = [
 nx, ny = 32, 32
 pix_size = 10.0 / 32 * u.deg
 
-# Compute pixel size in physical units
-# For a focal_length F and angular pixel size θ: physical_size = F * tan(θ)
+# Focal length of the lens
 focal_length = 0.46 * u.m
-pixel_size_m = focal_length * np.tan(pix_size)
 
-# Create rectangular pixel layout manually
-# Generate pixel positions in a 32x32 grid
-pix_range_m = (32 / 2 * pixel_size_m).to(u.m).value
-x = np.linspace(-pix_range_m, pix_range_m, 32)
-y = np.linspace(-pix_range_m, pix_range_m, 32)
+# Actual Hamamatsu detector measurements (from S13361-3050AE-08 datasheet)
+# Each pixel: 3.0 mm × 3.0 mm
+# 8×8 pixels per detector module, 4×4 modules per telescope = 32×32 total pixels
+pixel_pitch_mm = 3.0  # mm
+pixel_pitch_m = pixel_pitch_mm / 1000.0  # convert to meters
+
+# Create rectangular pixel layout for 32x32 grid
+# Centered at origin
+x = np.arange(32) * pixel_pitch_m - (32 - 1) * pixel_pitch_m / 2
+y = np.arange(32) * pixel_pitch_m - (32 - 1) * pixel_pitch_m / 2
 xx, yy = np.meshgrid(x, y)
 pix_x = xx.flatten()
 pix_y = yy.flatten()
+
+pixel_size_m = pixel_pitch_m
 
 # Create camera geometry with explicit pixel positions
 geometry = CameraGeometry(
@@ -62,8 +67,8 @@ geometry = CameraGeometry(
     pix_id=np.arange(1024),
     pix_x=pix_x * u.m,
     pix_y=pix_y * u.m,
-    pix_area=np.ones(1024) * (pixel_size_m ** 2).to(u.m**2),
-    pix_type="hexagonal",  # Approximate shape
+    pix_area=np.ones(1024) * (pixel_pitch_m ** 2) * u.m**2,
+    pix_type="square",  # Square pixels for 32x32 grid layout
     neighbors=None,  # Will be computed automatically
 )
 
@@ -93,7 +98,7 @@ lens_area = 3.1416 * radius * radius
 
 optics = OpticsDescription(
     name="Panoseti_Fresnel",
-    size_type=SizeType.SST,
+    size_type=SizeType.UNKNOWN,
     n_mirrors=1,
     n_mirror_tiles=1,
     equivalent_focal_length=focal_length,

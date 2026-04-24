@@ -17,7 +17,7 @@ Last modified: 17 April 2026
 import logging
 
 # Import main classes
-from .eventsource import PanoEventSource
+from .eventsource import CalibrationPipeline, PanoEventSource
 
 # Import instrument definitions
 from .instrument import (
@@ -33,17 +33,18 @@ from .instrument import (
 
 # Import utility functions
 from .functions import (
-    apply_packet_loss_filter,
+    apply_gain_correction,
     apply_rate_spike_filter,
     calculate_pedestal_and_pedvar_robust,
-    compute_pedestals_from_data,
+    calibrate_image,
     load_gain_file,
-    select_time_interval,
+    subtract_pedestal,
     wr_to_unix,
 )
 
 __all__ = [
     # Main classes
+    "CalibrationPipeline",
     "PanoEventSource",
     # Instrument
     "camera",
@@ -54,13 +55,15 @@ __all__ = [
     "telescope_3",
     "telescope_4",
     "MODULE_TO_TEL_ID",
-    # Functions
-    "apply_packet_loss_filter",
+    # Calibration functions
+    "apply_gain_correction",
+    "calibrate_image",
+    "subtract_pedestal",
+    # Rate spike filtering
     "apply_rate_spike_filter",
+    # Utility functions
     "calculate_pedestal_and_pedvar_robust",
-    "compute_pedestals_from_data",
     "load_gain_file",
-    "select_time_interval",
     "wr_to_unix",
 ]
 

@@ -6,28 +6,37 @@ This module contains functions for:
 - Timestamp conversion (White Rabbit to Unix)
 - Pre-filtering (packet loss, rate spikes)
 - Pedestal computation with outlier removal
+- Pointing offset correction (pixel to sky coordinates)
 - Time interval selection
 
 Author: Sruthi Ravikularaman
-Last modified: 17 April 2026
+Last modified: 22 April 2026
 """
 
 import logging
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
 from scipy.optimize import curve_fit
+from astropy.coordinates import SkyCoord
+import astropy.units as u
+from astropy.time import Time
 
 __all__ = [
     "load_gain_file",
+    "subtract_pedestal",
+    "apply_gain_correction",
+    "calibrate_image",
     "wr_to_unix",
     "apply_packet_loss_filter",
     "apply_rate_spike_filter",
-    "compute_pedestals_from_data",
     "calculate_pedestal_and_pedvar_robust",
-    "select_time_interval",
+    "load_pointing_offset_csv",
+    "pixel_to_skycoord",
+    "get_pointing_offset_for_observation",
+    "rotate_images_after_meridian_flip",
 ]
 
 logger = logging.getLogger(__name__)
@@ -38,7 +47,7 @@ logger = logging.getLogger(__name__)
 # ==============================================================================
 
 
-def load_gain_file(tel_id, gain_file_path):
+def load_gain_file(tel_id, gain_file_path=None):
     """
     Load per-pixel gain calibration from CSV file.
 
@@ -46,14 +55,29 @@ def load_gain_file(tel_id, gain_file_path):
     ----------
     tel_id : int
         Telescope ID
-    gain_file_path : str or Path
-        Path to CSV file with 32x32 gain matrix
+    gain_file_path : str, Path, or None
+        Path to CSV file with 32x32 gain matrix.
+        If None, uses default packaged gain file for the telescope.
 
     Returns
     -------
     np.ndarray
         32x32 array of per-pixel gain values
     """
+    # If no path provided, use default packaged file
+    if gain_file_path is None:
+        from pathlib import Path
+        data_dir = Path(__file__).parent.parent / "data"
+        # Map telescope IDs to gain file names
+        telescope_names = {
+            1: "Gattini",
+            2: "Winter",
+            3: "Fern",
+            4: "PTI-Heli"
+        }
+        tel_name = telescope_names.get(tel_id, f"tel{tel_id}")
+        gain_file_path = data_dir / f"gains_tel{tel_id}_{tel_name}.csv"
+    
     try:
         df = pd.read_csv(gain_file_path, header=None)
         gains = df.values.astype(np.float32)
@@ -66,8 +90,9 @@ def load_gain_file(tel_id, gain_file_path):
         logger.error(f"Failed to load gain file for tel {tel_id} ({gain_file_path}): {e}")
         raise
 
+
 # ==============================================================================
-# TIMESTAMP AND DATA FILTERING
+# TIMESTAMP CONVERSION
 # ==============================================================================
 
 
@@ -152,45 +177,52 @@ def wr_to_unix(pkt_nsec, tv_sec, tv_usec, ignore_clock_desync=False):
     return out_ns.astype("datetime64[ns]")
 
 
-def apply_packet_loss_filter(data, metadata):
-    """
-    Remove events with packet loss from any QUABO.
+# ==============================================================================
+# DATA FILTERING
+# ==============================================================================
 
-    If any QUABO has pkt_num == 0 for an event, that event is dropped.
+
+def apply_packet_loss_filter(metadata, data=None):
+    """
+    Filter out events with packet loss (pkt_num == 0 in any QUABO).
+
+    When pkt_num == 0 for any QUABO, it indicates missing data for that
+    QUABO. This function creates a mask to exclude such events.
 
     Parameters
     ----------
-    data : np.ndarray
-        Event data array
     metadata : dict
-        Metadata dictionary with QUABO information
+        Metadata dictionary from PFF file containing quabo_0, quabo_1, quabo_2, quabo_3 entries
+    data : np.ndarray, optional
+        Event data array. If provided, will be filtered and returned along with mask.
 
     Returns
     -------
-    data_filtered : np.ndarray
-        Data with packet-loss events removed
-    valid_mask : np.ndarray
-        Boolean mask of valid events
+    loss_mask : np.ndarray
+        Boolean mask of events to keep (True = keep, False = packet loss)
     pkt_loss_count : int
-        Number of events removed
+        Number of events removed due to packet loss
     """
-    pkt_num_0 = metadata["quabo_0"]["pkt_num"]
-    pkt_num_1 = metadata["quabo_1"]["pkt_num"]
-    pkt_num_2 = metadata["quabo_2"]["pkt_num"]
-    pkt_num_3 = metadata["quabo_3"]["pkt_num"]
+    # Get packet numbers from all 4 QUABOs
+    pkt_num_0 = np.asarray(metadata["quabo_0"]["pkt_num"])
+    pkt_num_1 = np.asarray(metadata["quabo_1"]["pkt_num"])
+    pkt_num_2 = np.asarray(metadata["quabo_2"]["pkt_num"])
+    pkt_num_3 = np.asarray(metadata["quabo_3"]["pkt_num"])
 
-    # Valid events: all QUABOs have pkt_num != 0
-    valid_mask = (
-        (pkt_num_0 != 0) & (pkt_num_1 != 0) & (pkt_num_2 != 0) & (pkt_num_3 != 0)
+    # Create mask: keep events where ALL QUABOs have pkt_num != 0
+    loss_mask = (pkt_num_0 != 0) & (pkt_num_1 != 0) & (pkt_num_2 != 0) & (pkt_num_3 != 0)
+
+    pkt_loss_count = np.sum(~loss_mask)
+    pct = 100 * pkt_loss_count / len(loss_mask) if len(loss_mask) > 0 else 0
+    logger.info(
+        f"Packet loss filter: removed {pkt_loss_count} events ({pct:.2f}%)"
     )
 
-    data_filtered = data[valid_mask]
-    pkt_loss_count = len(data) - len(data_filtered)
+    if data is not None:
+        data_filtered = data[loss_mask]
+        return loss_mask, pkt_loss_count, data_filtered
 
-    pct = 100 * pkt_loss_count / len(data) if len(data) > 0 else 0
-    logger.info(f"Packet loss filter: removed {pkt_loss_count} events ({pct:.2f}%)")
-
-    return data_filtered, valid_mask, pkt_loss_count
+    return loss_mask, pkt_loss_count
 
 
 def apply_rate_spike_filter(timestamps, bin_width=30, rate_threshold=2.0):
@@ -258,37 +290,6 @@ def apply_rate_spike_filter(timestamps, bin_width=30, rate_threshold=2.0):
 # ==============================================================================
 
 
-def compute_pedestals_from_data(data_array):
-    """
-    Compute per-pixel pedestal (mean) and variance from a set of events.
-
-    Parameters
-    ----------
-    data_array : np.ndarray
-        Array of shape (n_events, 1024) containing raw pulse heights
-
-    Returns
-    -------
-    pedestal : np.ndarray
-        Shape (32, 32) per-pixel mean values
-    pedvar : np.ndarray
-        Shape (32, 32) per-pixel variance values
-    """
-    # Reshape all events to (n_events, 32, 32) and compute mean and variance
-    n_events = len(data_array)
-    images = np.array(
-        [np.array(event, dtype=np.float32).reshape((32, 32)) for event in data_array]
-    )
-    pedestal = np.mean(images, axis=0)
-    pedvar = np.var(images, axis=0)
-    logger.info(
-        f"Computed pedestal from {n_events} events: "
-        f"mean={pedestal.mean():.2f}, std={pedestal.std():.2f}"
-    )
-    logger.info(
-        f"Pedestal variance: mean={pedvar.mean():.2f}, std={pedvar.std():.2f}"
-    )
-    return pedestal, pedvar
 
 
 def _gaussian(x, A, mu, sigma):
@@ -385,47 +386,329 @@ def calculate_pedestal_and_pedvar_robust(
     )
 
 
-def select_time_interval(timestamps: np.ndarray, data: np.ndarray, start_time, end_time) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+# ==============================================================================
+# CALIBRATION PIPELINE
+# ==============================================================================
+
+
+def subtract_pedestal(image, pedestal):
     """
-    Select data within a time interval.
+    Subtract pedestal from raw camera image.
 
     Parameters
     ----------
-    timestamps : np.ndarray
-        1D array of unix timestamps (seconds)
-    data : np.ndarray
-        Data frames in format (n_frames, n_pixels)
-    start_time : str or pd.Timestamp
-        Start time in format 'YYYY-MM-DDTHH:MM:SSZ' or Pandas Timestamp
-    end_time : str or pd.Timestamp
-        End time in format 'YYYY-MM-DDTHH:MM:SSZ' or Pandas Timestamp
+    image : np.ndarray
+        Raw pulse height image, shape (1024,) or (32, 32)
+    pedestal : np.ndarray
+        Pedestal values, same shape as image
 
     Returns
     -------
-    data_cut : np.ndarray
-        Data within the interval
-    timestamps_cut : np.ndarray
-        Timestamps within the interval
-    indices : np.ndarray
-        Indices of selected events in original arrays
+    np.ndarray
+        Pedestal-subtracted image
     """
-    # Convert timestamps to pandas DatetimeIndex
-    timestamps_df = pd.to_datetime(timestamps, unit="s", utc=True)
+    if image.shape != pedestal.shape:
+        # Try to reshape
+        if image.size == 1024 and pedestal.shape == (32, 32):
+            image_reshaped = image.reshape(32, 32)
+            result = image_reshaped - pedestal
+            return result.flatten()
+        else:
+            logger.warning(
+                f"Image shape {image.shape} != pedestal shape {pedestal.shape}"
+            )
+    return image - pedestal
 
-    # Convert time strings to Timestamp if needed
-    if isinstance(start_time, str):
-        start_time = pd.to_datetime(start_time, utc=True)
-    if isinstance(end_time, str):
-        end_time = pd.to_datetime(end_time, utc=True)
 
-    # Find index range
-    start_idx = timestamps_df.searchsorted(start_time, side="left")
-    end_idx = timestamps_df.searchsorted(end_time, side="right")
+def apply_gain_correction(image, gains):
+    """
+    Apply per-pixel gain correction to calibrate raw ADC → physical units.
 
-    indices = np.arange(start_idx, end_idx)
-    data_cut = data[start_idx:end_idx]
-    timestamps_cut = timestamps[start_idx:end_idx]
+    Parameters
+    ----------
+    image : np.ndarray
+        Pedestal-subtracted image, shape (1024,) or (32, 32)
+    gains : np.ndarray
+        Gain values (typically 1.0 for identity), shape (32, 32) or (1024,)
 
-    logger.info(f"Selected {len(data_cut)} events from {start_time} to {end_time}")
+    Returns
+    -------
+    np.ndarray
+        Gain-corrected image
+    """
+    if image.shape != gains.shape:
+        # Try to reshape
+        if image.size == 1024 and gains.shape == (32, 32):
+            image_reshaped = image.reshape(32, 32)
+            result = image_reshaped * gains
+            return result.flatten()
+        else:
+            logger.warning(f"Image shape {image.shape} != gains shape {gains.shape}")
+    return image * gains
 
-    return data_cut, timestamps_cut, indices
+
+def calibrate_image(image, pedestal=None, gains=None):
+    """
+    Apply full calibration: pedestal subtraction + gain correction.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        Raw pulse height image, shape (1024,) or (32, 32)
+    pedestal : np.ndarray, optional
+        Pedestal array, shape (32, 32) or (1024,)
+        If None, no pedestal subtraction is applied
+    gains : np.ndarray, optional
+        Gain correction array, shape (32, 32) or (1024,)
+        If None, no gain correction is applied
+
+    Returns
+    -------
+    np.ndarray
+        Fully calibrated image
+    """
+    calibrated = image.copy()
+    
+    if pedestal is not None:
+        calibrated = subtract_pedestal(calibrated, pedestal)
+    
+    if gains is not None:
+        calibrated = apply_gain_correction(calibrated, gains)
+    
+    return calibrated
+
+
+# ==============================================================================
+# POINTING OFFSET CORRECTION
+# ==============================================================================
+
+
+def load_pointing_offset_csv(csv_path=None):
+    """
+    Load pointing offset CSV file with source pixel coordinates.
+
+    CSV format: date, tel, pixel_x, pixel_y
+    where pixel_x, pixel_y are in range [0, 32) for 32x32 camera.
+
+    Parameters
+    ----------
+    csv_path : str or Path, optional
+        Path to pointing offset CSV file. If None, uses default packaged file.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with columns: date, tel, pixel_x, pixel_y
+        Date is converted to datetime64
+    """
+    if csv_path is None:
+        data_dir = Path(__file__).parent.parent / "data"
+        csv_path = data_dir / "pointing_offsets.csv"
+
+    try:
+        df = pd.read_csv(csv_path)
+        # Convert date column to datetime
+        df["date"] = pd.to_datetime(df["date"])
+        logger.info(f"Loaded pointing offsets from {csv_path}: {len(df)} entries")
+        return df
+    except Exception as e:
+        logger.error(f"Failed to load pointing offset CSV {csv_path}: {e}")
+        raise
+
+
+def pixel_to_skycoord(
+    pixel_x: float,
+    pixel_y: float,
+    tel_pointing_ra_deg: float,
+    tel_pointing_dec_deg: float,
+    obs_time: Time,
+    focal_length_m: float = 0.46,
+    pixel_size_mm: float = 3.0,
+) -> SkyCoord:
+    """
+    Convert pixel coordinates to sky coordinates (RA/Dec).
+
+    Converts pixel position in camera frame to focal plane angle,
+    then combines with telescope pointing to get final sky position.
+
+    Parameters
+    ----------
+    pixel_x : float
+        Pixel X coordinate (0-32, center is 16)
+    pixel_y : float
+        Pixel Y coordinate (0-32, center is 16)
+    tel_pointing_ra_deg : float
+        Telescope pointing RA in degrees
+    tel_pointing_dec_deg : float
+        Telescope pointing Dec in degrees
+    obs_time : astropy Time
+        Observation time for coordinate transformation
+    focal_length_m : float
+        Focal length of optics in meters (default 0.46 m)
+    pixel_size_mm : float
+        Physical size of pixel in mm (default 3.0 mm)
+
+    Returns
+    -------
+    SkyCoord
+        Detected source position in ICRS frame
+    """
+    # Convert pixel coordinates to mm on detector
+    # Pixel (16, 16) is center, pixel (0, 0) is corner
+    pixel_offset_mm = np.array([(pixel_x - 16) * pixel_size_mm, (pixel_y - 16) * pixel_size_mm])
+
+    # Convert mm to radians on focal plane
+    focal_plane_angle = pixel_offset_mm / 1000.0 / focal_length_m  # radians
+
+    # Create offset SkyCoord in Alt/Az (focal plane is tangent to sky)
+    # Offset in Alt is positive toward +Y (pixel Y direction)
+    # Offset in Az is positive toward +X (pixel X direction, but AZ is opposite)
+    offset_alt_deg = np.degrees(focal_plane_angle[1])
+    offset_az_deg = -np.degrees(focal_plane_angle[0])  # Negative because AZ convention
+
+    # Create base pointing coordinate
+    base_coord = SkyCoord(
+        ra=tel_pointing_ra_deg * u.deg,
+        dec=tel_pointing_dec_deg * u.deg,
+        frame="icrs",
+        obstime=obs_time
+    )
+
+    # Apply offset by shifting in celestial frame
+    # For small angles, can use small angle approximation
+    # ΔRA = ΔAz / cos(Dec)
+    # ΔDec = ΔAlt
+    dec_rad = np.radians(tel_pointing_dec_deg)
+    offset_ra = offset_az_deg / np.cos(dec_rad)
+    offset_dec = offset_alt_deg
+
+    source_ra_deg = tel_pointing_ra_deg + offset_ra
+    source_dec_deg = tel_pointing_dec_deg + offset_dec
+
+    source_coord = SkyCoord(
+        ra=source_ra_deg * u.deg,
+        dec=source_dec_deg * u.deg,
+        frame="icrs",
+        obstime=obs_time
+    )
+
+    return source_coord
+
+
+def get_pointing_offset_for_observation(
+    obs_date, tel_id, pointing_offset_df: Optional[pd.DataFrame] = None
+) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Get pointing offset (pixel coordinates) for a specific observation.
+
+    Matches observation date (YYYYMMDD) to the pointing offset CSV.
+    Returns None if no matching entry found.
+
+    Parameters
+    ----------
+    obs_date : str or pd.Timestamp
+        Observation date ('YYYYMMDD' format or Timestamp)
+    tel_id : int
+        Telescope ID (1, 2, 3, or 4)
+    pointing_offset_df : pd.DataFrame, optional
+        Pre-loaded pointing offset DataFrame. If None, will load from default file.
+
+    Returns
+    -------
+    pixel_x : float or None
+        Pixel X coordinate of source (or None if not found)
+    pixel_y : float or None
+        Pixel Y coordinate of source (or None if not found)
+    """
+    if pointing_offset_df is None:
+        pointing_offset_df = load_pointing_offset_csv()
+
+    # Convert obs_date to datetime
+    if isinstance(obs_date, str):
+        obs_date_dt = pd.to_datetime(obs_date)
+    else:
+        obs_date_dt = pd.to_datetime(obs_date)
+
+    # Extract date part
+    obs_date_only = obs_date_dt.date()
+
+    # Filter by date and telescope
+    matching = pointing_offset_df[
+        (pointing_offset_df["date"].dt.date == obs_date_only)
+        & (pointing_offset_df["tel"] == tel_id)
+    ]
+
+    if len(matching) == 0:
+        logger.warning(
+            f"No pointing offset found for {obs_date_only}, tel {tel_id}. "
+            f"Using default center (16, 16)."
+        )
+        return 16.0, 16.0
+
+    if len(matching) > 1:
+        logger.warning(
+            f"Multiple matching offsets for {obs_date_only}, tel {tel_id}. "
+            f"Using first entry."
+        )
+
+    row = matching.iloc[0]
+    return row["pixel_x"], row["pixel_y"]
+
+
+# ==============================================================================
+# MERIDIAN FLIP CORRECTION
+# ==============================================================================
+
+
+def rotate_images_after_meridian_flip(
+    data: np.ndarray,
+    meridian_flip_phase: str = "pre",
+    n_pix: int = 32,
+) -> np.ndarray:
+    """
+    Rotate images by 180° if observation is post-meridian-flip.
+
+    When a telescope crosses the meridian (post-flip), the entire field rotates 180°.
+    This function rotates post-flip images to align with pre-flip coordinate system
+    for consistent analysis across multiple observations.
+
+    Parameters
+    ----------
+    data : np.ndarray
+        Event data, shape (n_events, n_pix*n_pix)
+    meridian_flip_phase : str, optional
+        Phase of observation: "pre" or "post" (default: "pre").
+        If "pre", data is returned unchanged. If "post", data is rotated 180°.
+    n_pix : int, optional
+        Pixel grid dimension (default 32 for 32×32 camera)
+
+    Returns
+    -------
+    data_corrected : np.ndarray
+        Data rotated by 180° if post-flip, otherwise unchanged.
+        Shape: (n_events, n_pix*n_pix)
+    """
+    if meridian_flip_phase == "pre":
+        logger.debug("Pre-meridian-flip observation: no rotation needed")
+        return data
+
+    if meridian_flip_phase != "post":
+        logger.warning(
+            f"Unknown meridian_flip_phase '{meridian_flip_phase}'. "
+            f"Expected 'pre' or 'post'. Returning data unchanged."
+        )
+        return data
+
+    # Reshape from (n, n_pix*n_pix) → (n, n_pix, n_pix)
+    reshaped_data = np.reshape(data, (len(data), n_pix, n_pix))
+
+    # Rotate each frame by 180° (k=2 means 2 × 90° = 180°)
+    rotated_data = np.rot90(reshaped_data, k=2, axes=(1, 2))
+
+    # Reshape back from (n, n_pix, n_pix) → (n, n_pix*n_pix)
+    reshaped_rotated_data = np.reshape(rotated_data, (len(data), n_pix * n_pix))
+
+    logger.info(f"Post-meridian-flip rotation applied: rotated {len(data)} images by 180°")
+
+    return reshaped_rotated_data
+

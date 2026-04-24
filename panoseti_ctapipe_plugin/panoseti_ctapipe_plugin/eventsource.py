@@ -32,16 +32,21 @@ from .instrument import (
     subarray,
 )
 from .functions import (
+    apply_gain_correction,
     apply_packet_loss_filter,
     apply_rate_spike_filter,
     calculate_pedestal_and_pedvar_robust,
-    compute_pedestals_from_data,
+    calibrate_image,
+    get_pointing_offset_for_observation,
     load_gain_file,
-    select_time_interval,
+    load_pointing_offset_csv,
+    pixel_to_skycoord,
+    rotate_images_after_meridian_flip,
+    subtract_pedestal,
     wr_to_unix,
 )
 
-__all__ = ["PanoEventSource"]
+__all__ = ["PanoEventSource", "CalibrationPipeline"]
 
 logger = logging.getLogger(__name__)
 
@@ -50,12 +55,12 @@ class PanoEventSource(EventSource):
     """
     EventSource for PANOSETI PFF pulse height data.
 
-    Reads raw pulse heights from PFF module files, applies calibration
-    (pedestal subtraction, gain correction), and yields DL1 calibrated images.
+    Reads raw pulse heights from PFF module files and yields DL1 images.
+    For a complete calibration workflow with pedestal computation and filtering,
+    use CalibrationPipeline.
 
-    Pre-filtering is applied to remove bad events:
-    - Packet loss detection (QUABOs with pkt_num == 0)
-    - Rate spike filtering (removes high-rate trigger events)
+    If pedestals and gains are provided via files, they will be applied during
+    event iteration. Otherwise, identity operations are used.
     """
 
     is_simulation = False
@@ -70,6 +75,8 @@ class PanoEventSource(EventSource):
         pointing_mode=None,
         pedestal_file=None,
         gain_file=None,
+        pointing_offset_csv=None,
+        meridian_flip_phase=None,
         **kwargs
     ):
         """
@@ -93,6 +100,13 @@ class PanoEventSource(EventSource):
             Path to gain calibration file (per-pixel gains for ADC → calibrated units).
             Currently all gains are set to 1.0 (identity). Will be measured and
             applied once available.
+        pointing_offset_csv : str or Path, optional
+            Path to CSV file with source pixel coordinates for pointing correction.
+            CSV should contain: date, tel, phase, pixel_x, pixel_y.
+            When provided, actual source position will be computed from pixel coords.
+        meridian_flip_phase : str, optional
+            Observation phase: "pre" or "post" (relative to meridian flip).
+            Default is "pre". Used to select correct pointing offset from CSV.
         **kwargs
             Additional arguments passed to EventSource
         """
@@ -108,36 +122,22 @@ class PanoEventSource(EventSource):
             sb_type if sb_type is not None else SchedulingBlockType.OBSERVATION
         )
         self.observing_mode = (
-            observing_mode if observing_mode is not None else ObservingMode.ON_OFF
+            observing_mode if observing_mode is not None else ObservingMode.ON_OFF #WOBBLE
         )
         self.pointing_mode = (
             pointing_mode if pointing_mode is not None else PointingMode.TRACK
         )
 
-        # Load pedestal calibration (TODO: implement loading from file)
+        # Load pedestal calibration from file (if provided)
         self._pedestals = {}
-        self._pedvars = {}  # Pedestal variances
-        self._pedestals_precomputed = False  # Track if pedestals were loaded from file
+        for tel_id in self._subarray.tel_ids:
+            # TODO: implement load_pedestal_file when pedestal format is finalized
+            # For now, initialize to zeros (identity operation)
+            self._pedestals[tel_id] = np.zeros((32, 32))
 
         # Load gain calibration from file (default or user-provided)
         self._gains = {}
-
         for tel_id in self._subarray.tel_ids:
-            # Pedestals: Initialize to zeros
-            # Will be computed from data if not provided via pedestal_file
-            self._pedestals[tel_id] = np.zeros((32, 32))
-            self._pedvars[tel_id] = np.zeros((32, 32))
-
-            # TODO: Load actual pedestals from pedestal_file when available
-            # if pedestal_file is not None:
-            #     self._pedestals[tel_id] = load_pedestal_file(pedestal_file, tel_id)
-            #     self._pedestals_precomputed = True
-
-        for tel_id in self._subarray.tel_ids:
-            # Pedestals: for now, no pedestal subtraction (zeros)
-            # TODO: Load actual pedestals from pedestal_file when available
-            self._pedestals[tel_id] = np.zeros((32, 32))
-
             # Gains: load from user file or default packaged file
             if gain_file is not None:
                 # User-provided gain file
@@ -163,139 +163,27 @@ class PanoEventSource(EventSource):
 
         super().__init__(input_url=input_url, **kwargs)
         self._pff_files = []
+        self._metadata = {}  # Store metadata for filtering use
+
+        # Load pointing offset corrections (pixel coordinates of source)
+        self._pointing_offset_df = None
+        if pointing_offset_csv is not None:
+            try:
+                self._pointing_offset_df = load_pointing_offset_csv(pointing_offset_csv)
+                logger.info(f"Loaded pointing offsets from {pointing_offset_csv}")
+            except Exception as e:
+                logger.warning(f"Failed to load pointing offsets: {e}. Will use housekeeping pointing.")
+
+        # Store meridian flip phase ("pre" or "post")
+        self._meridian_flip_phase = meridian_flip_phase if meridian_flip_phase is not None else "pre"
+        if self._meridian_flip_phase not in ("pre", "post"):
+            logger.warning(f"Invalid meridian_flip_phase '{self._meridian_flip_phase}'. Using 'pre'.")
+            self._meridian_flip_phase = "pre"
 
     @property
     def subarray(self):
         """Obtain the subarray from the EventSource."""
         return self._subarray
-
-    @property
-    def pedestals(self):
-        """
-        Get computed pedestals for all telescopes.
-
-        Returns
-        -------
-        dict
-            Dictionary mapping tel_id to 32x32 pedestal array
-        """
-        return self._pedestals
-
-    def get_pedestal(self, tel_id):
-        """Get pedestal for a specific telescope."""
-        return self._pedestals.get(tel_id, None)
-
-    @property
-    def pedvars(self):
-        """
-        Get pedestal variances for all telescopes.
-
-        Returns
-        -------
-        dict
-            Dictionary mapping tel_id to 32x32 variance array
-        """
-        return self._pedvars
-
-    def get_pedvar(self, tel_id):
-        """Get pedestal variance for a specific telescope."""
-        return self._pedvars.get(tel_id, None)
-
-    def save_pedestals(self, output_dir):
-        """
-        Save computed pedestals and variances to CSV files.
-
-        Parameters
-        ----------
-        output_dir : str or Path
-            Directory to save files to (one per telescope)
-        """
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        for tel_id in self._pedestals.keys():
-            # Save pedestals
-            ped_file = output_dir / f"pedestal_tel{tel_id}.csv"
-            np.savetxt(ped_file, self._pedestals[tel_id], delimiter=",", fmt="%.4f")
-            logger.info(f"Saved pedestal to {ped_file}")
-
-            # Save variances
-            var_file = output_dir / f"pedvar_tel{tel_id}.csv"
-            np.savetxt(var_file, self._pedvars[tel_id], delimiter=",", fmt="%.4f")
-            logger.info(f"Saved pedvar to {var_file}")
-
-    @staticmethod
-    def compute_pedestals_robust_on_data(
-        data: np.ndarray, nsig: float = 5.0, fit_gaussian: bool = True
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Compute robust pedestals and pedvars on given data with outlier removal.
-
-        Useful for analyzing pedestals on specific datasets or time intervals.
-
-        Parameters
-        ----------
-        data : np.ndarray
-            Data frames shape (n_frames, 1024) or (n_frames, 32, 32)
-        nsig : float
-            Sigma threshold for outlier removal (default = 5.0)
-        fit_gaussian : bool
-            If True, fit Gaussian to pedvar; else use std (default = True)
-
-        Returns
-        -------
-        pedestal : np.ndarray
-            Per-pixel mean values
-        pedvar : np.ndarray
-            Per-pixel variance (Gaussian sigma or std)
-        """
-        return calculate_pedestal_and_pedvar_robust(data, nsig=nsig, fit_gaussian=fit_gaussian)
-
-    @staticmethod
-    def compute_pedestals_on_interval(
-        timestamps: np.ndarray,
-        data: np.ndarray,
-        start_time,
-        end_time,
-        nsig: float = 5.0,
-        fit_gaussian: bool = True,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Compute pedestals and pedvars for a specific time interval.
-
-        Parameters
-        ----------
-        timestamps : np.ndarray
-            Unix timestamps (seconds) for each frame
-        data : np.ndarray
-            Data frames shape (n_frames, 1024) or (n_frames, 32, 32)
-        start_time : str or pd.Timestamp
-            Start time 'YYYY-MM-DDTHH:MM:SSZ' or Timestamp
-        end_time : str or pd.Timestamp
-            End time 'YYYY-MM-DDTHH:MM:SSZ' or Timestamp
-        nsig : float
-            Sigma threshold for outlier removal (default = 5.0)
-        fit_gaussian : bool
-            If True, fit Gaussian to pedvar (default = True)
-
-        Returns
-        -------
-        pedestal : np.ndarray
-            Per-pixel pedestal on interval
-        pedvar : np.ndarray
-            Per-pixel pedvar on interval
-        data_cut : np.ndarray
-            Data within the interval
-        timestamps_cut : np.ndarray
-            Timestamps within the interval
-        """
-        data_cut, timestamps_cut, _ = select_time_interval(
-            timestamps, data, start_time, end_time
-        )
-        pedestal, pedvar = calculate_pedestal_and_pedvar_robust(
-            data_cut, nsig=nsig, fit_gaussian=fit_gaussian
-        )
-        return pedestal, pedvar, data_cut, timestamps_cut
 
     @classmethod
     def is_compatible(cls, path):
@@ -309,14 +197,13 @@ class PanoEventSource(EventSource):
 
     def _generator(self):
         """
-        Generator that yields DL1 calibrated images from PFF pulse height data.
+        Generator that yields DL1 images from PFF pulse height data.
 
-        Applies pre-cleaning filters:
-        - Packet loss removal
-        - Rate spike filtering
+        Reads raw pulse heights from PFF files and applies pre-computed calibrations
+        (pedestal subtraction and gain correction).
 
-        Reads raw pulse heights from PFF files, applies pedestal subtraction and
-        gain calibration, and yields DL1 images.
+        For a complete calibration workflow including pedestal computation from data
+        and filtering, use CalibrationPipeline.
 
         Yields
         ------
@@ -367,24 +254,11 @@ class PanoEventSource(EventSource):
             data, metadata = pff_file.readpff(metadata=True)
             telescope_data[tel_id] = data
             telescope_metadata[tel_id] = metadata
+            self._metadata[tel_id] = metadata  # Store for filtering
             self._pff_files.append(pff_file)
             logger.info(f"Read {len(data)} events from telescope {tel_id}")
 
-        # ===== PRE-FILTERING: PACKET LOSS =====
-        for tel_id in tel_ids:
-            data_filtered, valid_mask, pkt_loss_count = apply_packet_loss_filter(
-                telescope_data[tel_id], telescope_metadata[tel_id]
-            )
-            telescope_data[tel_id] = data_filtered
-
-            # Also filter metadata arrays to match filtered data
-            for i in range(4):
-                for key in telescope_metadata[tel_id][f"quabo_{i}"]:
-                    arr = telescope_metadata[tel_id][f"quabo_{i}"][key]
-                    if hasattr(arr, "__len__") and len(arr) == len(valid_mask):
-                        telescope_metadata[tel_id][f"quabo_{i}"][key] = arr[valid_mask]
-
-        # ===== TIMESTAMP CONVERSION AND VALID EVENT MASK =====
+        # ===== TIMESTAMP CONVERSION =====
         all_timestamps_by_telescope = {}
         valid_event_mask_by_telescope = {}
 
@@ -406,42 +280,13 @@ class PanoEventSource(EventSource):
             timestamps = np.min(np.array(timestamps_qubao), axis=0)
             all_timestamps_by_telescope[tel_id] = timestamps
 
-        # ===== PRE-FILTERING: RATE SPIKES =====
-        # Apply spike filter independently to each telescope's timestamps
-        # (timestamps may not be perfectly synchronized across telescopes)
-        for tel_id in tel_ids:
-            spike_mask, spike_count = apply_rate_spike_filter(
-                all_timestamps_by_telescope[tel_id],
-                bin_width=30,  # 30 second bins
-                rate_threshold=2.0,  # 2 Hz threshold
-            )
-
-            # Apply spike mask to this telescope's data
-            telescope_data[tel_id] = telescope_data[tel_id][spike_mask]
-            all_timestamps_by_telescope[tel_id] = all_timestamps_by_telescope[tel_id][
-                spike_mask
-            ]
-
-        # ===== COMPUTE PEDESTALS FROM FILTERED DATA =====
-        # If pedestals were not provided at initialization, compute them from the data
-        for tel_id in tel_ids:
-            if not self._pedestals_precomputed:
-                # Pedestals were not loaded from file, compute from filtered data
-                logger.info(
-                    f"Computing pedestals for tel {tel_id} "
-                    f"from {len(telescope_data[tel_id])} events"
-                )
-                ped, pedvar = compute_pedestals_from_data(telescope_data[tel_id])
-                self._pedestals[tel_id] = ped
-                self._pedvars[tel_id] = pedvar
-            else:
-                logger.info(f"Using pre-loaded pedestals for tel {tel_id}")
-
         # Use first telescope as reference for event iteration
         ref_tel_id = tel_ids[0]
 
-        # Loop through events - use minimum count across all telescopes
-        # (since spike filtering is now independent per telescope)
+        # Loop through events
+        # Note: Raw data is used here without filtering.
+        # Filtering (packet loss, rate spikes) and pedestal computation
+        # should be done using CalibrationPipeline for standard workflows.
         num_events = min(len(telescope_data[tel_id]) for tel_id in tel_ids)
 
         event_count = 0
@@ -489,6 +334,10 @@ class PanoEventSource(EventSource):
                 event.trigger.tels_with_trigger.append(tel_id)
 
             event.index.obs_id = list(self.obs_ids)[0] if self.obs_ids else 0
+            
+            # Store source file paths for this event (for debugging/comparison)
+            event.meta = getattr(event, 'meta', {})
+            event.meta['source_files'] = {tel_id: module_files[tel_id] for tel_id in tel_ids}
 
             yield event
             event_count += 1
@@ -502,7 +351,7 @@ class PanoEventSource(EventSource):
 
     @property
     def observation_blocks(self):
-        """Extract observation metadata from input folder and housekeeping."""
+        """Extract observation metadata from input folder and housekeeping, with pointing offset correction if available."""
         try:
             # input_url is now the observation run folder
             data_dir = Path(self.input_url)
@@ -514,6 +363,17 @@ class PanoEventSource(EventSource):
             # Load housekeeping data using hkpff
             hkpff = pypff.io.hkpff(str(hk_file))
             hk = hkpff.readhk()
+
+            # Extract start time from any module file in the folder first (needed for matching CSV)
+            module_files = list(data_dir.glob("start*ph1024*module_*.*.pff"))
+            if not module_files:
+                return {}
+
+            # Parse filename to get start time
+            filename = module_files[0].name
+            start_str = filename.split("start_")[1].split(".")[0]
+            start_time = Time(start_str, format="isot")
+            obs_date = start_time.datetime.date()
 
             # Extract pointing info from first available mount
             mount_key = None
@@ -529,15 +389,46 @@ class PanoEventSource(EventSource):
             dec_deg = hk[mount_key]["dec_deg"]
             ra_deg = ra_hours * 15  # Convert hours to degrees
 
-            # Extract start time from any module file in the folder
-            module_files = list(data_dir.glob("start*ph1024*module_*.*.pff"))
-            if not module_files:
-                return {}
-
-            # Parse filename to get start time
-            filename = module_files[0].name
-            start_str = filename.split("start_")[1].split(".")[0]
-            start_time = Time(start_str, format="isot")
+            # Check if pointing offset correction is available
+            meridian_flip = self._meridian_flip_phase  # Use the phase specified at init
+            corrected_pointing = False
+            
+            if self._pointing_offset_df is not None:
+                # Look for matching entry in CSV (by date, telescope, and phase)
+                mask = (self._pointing_offset_df["date"].dt.date == obs_date)
+                if mask.any():
+                    # Try to find matching phase entry
+                    phase_mask = mask & (self._pointing_offset_df["phase"] == meridian_flip)
+                    if phase_mask.any():
+                        offset_row = self._pointing_offset_df[phase_mask].iloc[0]
+                    else:
+                        # Fallback to any matching date entry
+                        logger.warning(
+                            f"No matching phase '{meridian_flip}' for {obs_date}. Using first available entry."
+                        )
+                        offset_row = self._pointing_offset_df[mask].iloc[0]
+                    
+                    pixel_x = offset_row["pixel_x"]
+                    pixel_y = offset_row["pixel_y"]
+                    
+                    # Convert pixel coords to sky coords
+                    source_skycoord = pixel_to_skycoord(
+                        pixel_x=pixel_x,
+                        pixel_y=pixel_y,
+                        tel_pointing_ra_deg=ra_deg,
+                        tel_pointing_dec_deg=dec_deg,
+                        obs_time=start_time,
+                        focal_length_m=0.46,
+                        pixel_size_mm=3.0
+                    )
+                    
+                    ra_deg = source_skycoord.ra.deg
+                    dec_deg = source_skycoord.dec.deg
+                    corrected_pointing = True
+                    logger.info(
+                        f"Applied pointing correction ({meridian_flip} meridian flip): "
+                        f"pixel ({pixel_x}, {pixel_y}) → RA={ra_deg:.4f}°, Dec={dec_deg:.4f}°"
+                    )
 
             obs_id = 0
             obs_block = ObservationBlockContainer(
@@ -548,9 +439,14 @@ class PanoEventSource(EventSource):
                 subarray_pointing_lat=dec_deg * u.deg,
                 subarray_pointing_frame=CoordinateFrameType.ICRS,
             )
+            
+            # Add meridian flip phase to metadata
+            obs_block.meta["meridian_flip"] = meridian_flip
+            
             return {obs_id: obs_block}
         except Exception as e:
             # Fallback if parsing fails
+            logger.error(f"Error extracting observation blocks: {e}")
             return {}
 
     @property
@@ -575,7 +471,7 @@ class PanoEventSource(EventSource):
                 sb_id=sb_id,
                 producer_id="Panoseti",
                 sb_type=self.sb_type,
-                observing_mode=self.observing_mode,
+                observing_mode=self.observing_mode, #(POINT)
                 pointing_mode=self.pointing_mode,
             )
             return {sb_id: sb_block}
@@ -597,3 +493,386 @@ class PanoEventSource(EventSource):
     def obs_ids(self) -> Iterable[int]:
         """Return observation IDs from observation blocks."""
         return self.observation_blocks.keys()
+
+
+class CalibrationPipeline:
+    """
+    Standard calibration workflow for PANOSETI data.
+
+    Collects all events, computes pedestals from packet-loss and rate-spike filtered
+    events, then applies calibration (pedestal subtraction + gain correction) to all events.
+
+    Parameters
+    ----------
+    source : PanoEventSource
+        Event source to calibrate
+    spike_threshold : float, optional
+        Rate threshold in Hz for spike detection (default: 2.0)
+    bin_width : int, optional
+        Time bin width in seconds for rate calculation (default: 10)
+    gain_file : str or Path, optional
+        Path to custom gain calibration file. If None, uses default packaged files.
+    nsig : float, optional
+        Sigma threshold for outlier removal in pedestal calculation (default: 5.0)
+
+    Examples
+    --------
+    >>> source = PanoEventSource(input_url)
+    >>> pipeline = CalibrationPipeline(source, spike_threshold=2.0)
+    >>> calibrated_events = list(pipeline.calibrate_all())
+    """
+
+    def __init__(
+        self,
+        source,
+        spike_threshold=2.0,
+        bin_width=10,
+        gain_file=None,
+        nsig=5.0,
+    ):
+        self.source = source
+        self.spike_threshold = spike_threshold
+        self.bin_width = bin_width
+        self.gain_file = gain_file
+        self.nsig = nsig
+
+        self.pedestals = {}  # {tel_id: pedestal array}
+        self.gains = {}  # {tel_id: gain array}
+        self._all_events = None  # Cached all events
+        self._pedestals_computed = False
+
+        logger.info(
+            f"CalibrationPipeline initialized: "
+            f"spike_threshold={spike_threshold} Hz, bin_width={bin_width}s"
+        )
+
+    def _collect_all_events(self, verbose=True):
+        """Collect all events from source into cache. Idempotent."""
+        if self._all_events is not None:
+            return self._all_events
+
+        if verbose:
+            logger.info("Collecting all events from source...")
+
+        self._all_events = []
+        for i, event in enumerate(self.source):
+            if verbose and i % 100 == 0:
+                logger.info(f"  Collected {i} events...")
+            self._all_events.append(event)
+
+        if verbose:
+            logger.info(f"Collected {len(self._all_events)} total events")
+        return self._all_events
+
+    def _organize_event_data(self, verbose=True):
+        """
+        Organize raw event data by telescope.
+
+        Returns
+        -------
+        all_data : dict
+            {tel_id: np.array of images}
+        all_timestamps : dict
+            {tel_id: np.array of timestamps}
+        """
+        all_events = self._collect_all_events(verbose=verbose)
+
+        all_data = {tel_id: [] for tel_id in self.source.subarray.tel_ids}
+        all_timestamps = {tel_id: [] for tel_id in self.source.subarray.tel_ids}
+
+        for event in all_events:
+            for tel_id in self.source.subarray.tel_ids:
+                if tel_id in event.trigger.tels_with_trigger:
+                    all_data[tel_id].append(event.dl1.tel[tel_id].image)
+                    all_timestamps[tel_id].append(event.trigger.tel[tel_id].time.unix)
+
+        # Convert to numpy arrays
+        all_data_np = {}
+        all_timestamps_np = {}
+        for tel_id in self.source.subarray.tel_ids:
+            all_data_np[tel_id] = np.array(all_data[tel_id]) if all_data[tel_id] else np.array([])
+            all_timestamps_np[tel_id] = np.array(all_timestamps[tel_id]) if all_timestamps[tel_id] else np.array([])
+
+        return all_data_np, all_timestamps_np
+
+    def _apply_packet_loss_filtering(self, all_data, all_timestamps, verbose=True):
+        """
+        Apply packet loss filtering to all telescopes.
+
+        Parameters
+        ----------
+        all_data : dict
+            {tel_id: data array}
+        all_timestamps : dict
+            {tel_id: timestamps array}
+        verbose : bool
+
+        Returns
+        -------
+        all_data : dict
+            Filtered data
+        all_timestamps : dict
+            Filtered timestamps
+        """
+        if verbose:
+            logger.info("Applying packet loss filtering...")
+
+        for tel_id in self.source.subarray.tel_ids:
+            if not all_data[tel_id].size:
+                continue
+
+            if tel_id in self.source._metadata:
+                loss_mask, loss_count, data_filtered = apply_packet_loss_filter(
+                    self.source._metadata[tel_id], data=all_data[tel_id]
+                )
+                all_data[tel_id] = data_filtered
+                all_timestamps[tel_id] = all_timestamps[tel_id][loss_mask]
+
+                if verbose:
+                    logger.info(f"  Tel {tel_id}: Removed {loss_count} events (packet loss)")
+            else:
+                if verbose:
+                    logger.warning(f"  Tel {tel_id}: No metadata for packet loss filtering (skipping)")
+
+        return all_data, all_timestamps
+
+    def _apply_rate_spike_filtering(self, all_data, all_timestamps, verbose=True):
+        """
+        Apply rate spike filtering to all telescopes.
+
+        Parameters
+        ----------
+        all_data : dict
+            {tel_id: data array}
+        all_timestamps : dict
+            {tel_id: timestamps array}
+        verbose : bool
+
+        Returns
+        -------
+        all_data : dict
+            Filtered data
+        """
+        if verbose:
+            logger.info("Applying rate spike filtering...")
+
+        for tel_id in self.source.subarray.tel_ids:
+            if not all_timestamps[tel_id].size:
+                continue
+
+            spike_mask, spike_count = apply_rate_spike_filter(
+                all_timestamps[tel_id],
+                bin_width=self.bin_width,
+                rate_threshold=self.spike_threshold,
+            )
+            all_data[tel_id] = all_data[tel_id][spike_mask]
+
+            if verbose:
+                logger.info(f"  Tel {tel_id}: Removed {spike_count} events (rate spikes)")
+
+        return all_data
+
+    def compute_pedestals(self, all_data, verbose=True):
+        """
+        Compute pedestals from filtered event data.
+
+        Parameters
+        ----------
+        all_data : dict
+            {tel_id: filtered data array}
+        verbose : bool
+
+        Returns
+        -------
+        dict
+            {tel_id: pedestal array shape (32, 32)}
+        """
+        if verbose:
+            logger.info("Computing pedestals from filtered data...")
+
+        for tel_id in self.source.subarray.tel_ids:
+            if not all_data[tel_id].size:
+                logger.warning(f"Tel {tel_id}: No data available, using zero pedestals")
+                self.pedestals[tel_id] = np.zeros((32, 32))
+                continue
+
+            # Compute pedestals on filtered data
+            ped_flat, _ = calculate_pedestal_and_pedvar_robust(
+                all_data[tel_id], nsig=self.nsig, fit_gaussian=True
+            )
+            self.pedestals[tel_id] = ped_flat.reshape(32, 32)
+
+            if verbose:
+                logger.info(f"  Tel {tel_id}: Pedestal from {len(all_data[tel_id])} events")
+
+        self._pedestals_computed = True
+        return self.pedestals
+
+    def load_gains(self, verbose=True):
+        """
+        Load per-pixel gain calibration for all telescopes.
+
+        Parameters
+        ----------
+        verbose : bool
+
+        Returns
+        -------
+        dict
+            {tel_id: gain array shape (32, 32)}
+        """
+        if verbose:
+            logger.info("Loading gain calibration...")
+
+        for tel_id in self.source.subarray.tel_ids:
+            self.gains[tel_id] = load_gain_file(tel_id, self.gain_file)
+            if verbose:
+                logger.info(f"  Tel {tel_id}: Loaded gains")
+
+        return self.gains
+
+    def calibrate_all(self, verbose=True):
+        """
+        Apply full calibration pipeline to all events.
+
+        Orchestrates: event collection → packet loss filtering → rate spike filtering →
+        pedestal computation → gain loading → calibration application.
+
+        Parameters
+        ----------
+        verbose : bool, optional
+            If True, print progress information
+
+        Yields
+        ------
+        ArrayEventContainer
+            Calibrated events with pedestal and gain corrections applied
+        """
+        if not self._pedestals_computed:
+            # Organize data by telescope
+            all_data, all_timestamps = self._organize_event_data(verbose=verbose)
+
+            # Apply filters
+            all_data, all_timestamps = self._apply_packet_loss_filtering(
+                all_data, all_timestamps, verbose=verbose
+            )
+            all_data = self._apply_rate_spike_filtering(
+                all_data, all_timestamps, verbose=verbose
+            )
+
+            # Compute pedestals and load gains
+            self.compute_pedestals(all_data, verbose=verbose)
+            self.load_gains(verbose=verbose)
+
+        # Apply calibration to all cached events
+        all_events = self._all_events
+        if verbose:
+            logger.info("Applying calibration to all events...")
+
+        for i, event in enumerate(all_events):
+            if verbose and i % 100 == 0:
+                logger.info(f"  Calibrated {i} events...")
+
+            for tel_id in self.source.subarray.tel_ids:
+                if tel_id in event.dl1.tel:
+                    raw_image = event.dl1.tel[tel_id].image
+                    calibrated = calibrate_image(
+                        raw_image,
+                        pedestal=self.pedestals[tel_id].flatten(),
+                        gains=self.gains[tel_id].flatten(),
+                    )
+                    event.dl1.tel[tel_id].image = calibrated
+
+            yield event
+
+        if verbose:
+            logger.info(f"Calibration complete: {len(all_events)} events")
+
+    def save_pedestals(self, output_dir):
+        """
+        Save computed pedestals to CSV files.
+
+        Parameters
+        ----------
+        output_dir : str or Path
+            Directory to save pedestal files to
+        """
+        if not self._pedestals_computed:
+            raise ValueError("Pedestals not yet computed. Call compute_pedestals() first.")
+
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        for tel_id, ped in self.pedestals.items():
+            ped_file = output_dir / f"pedestal_tel{tel_id}.csv"
+            np.savetxt(ped_file, ped, delimiter=",", fmt="%.6f")
+            logger.info(f"Saved pedestal to {ped_file}")
+
+    def get_pedestals(self):
+        """
+        Get computed pedestals for all telescopes.
+
+        Returns
+        -------
+        dict
+            Dictionary mapping tel_id to 32x32 pedestal array
+
+        Raises
+        ------
+        ValueError
+            If pedestals have not been computed yet
+        """
+        if not self._pedestals_computed:
+            raise ValueError("Pedestals not yet computed. Call compute_pedestals() first.")
+        return self.pedestals
+
+    def get_pedestal(self, tel_id):
+        """
+        Get pedestal for a specific telescope.
+
+        Parameters
+        ----------
+        tel_id : int
+            Telescope ID
+
+        Returns
+        -------
+        np.ndarray
+            32x32 pedestal array for the telescope
+
+        Raises
+        ------
+        ValueError
+            If pedestals have not been computed
+        """
+        if not self._pedestals_computed:
+            raise ValueError("Pedestals not yet computed. Call compute_pedestals() first.")
+        return self.pedestals.get(tel_id, None)
+
+    @staticmethod
+    def compute_pedestals_robust_on_data(
+        data: np.ndarray, nsig: float = 5.0, fit_gaussian: bool = True
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Compute robust pedestals and pedvars on given data with outlier removal.
+
+        Useful for analyzing pedestals on specific datasets or time intervals.
+
+        Parameters
+        ----------
+        data : np.ndarray
+            Data frames shape (n_frames, 1024) or (n_frames, 32, 32)
+        nsig : float, optional
+            Sigma threshold for outlier removal (default = 5.0)
+        fit_gaussian : bool, optional
+            If True, fit Gaussian to pedvar; else use std (default = True)
+
+        Returns
+        -------
+        pedestal : np.ndarray
+            Per-pixel mean values
+        pedvar : np.ndarray
+            Per-pixel variance (Gaussian sigma or std)
+        """
+        return calculate_pedestal_and_pedvar_robust(data, nsig=nsig, fit_gaussian=fit_gaussian)
+
