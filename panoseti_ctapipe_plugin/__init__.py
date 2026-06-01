@@ -6,22 +6,32 @@ and the ctapipe gamma-ray analysis framework.
 
 Main components:
 - PanoEventSource: EventSource for reading PANOSETI PFF files
-
 - Utility functions: Timestamp conversion, filtering, calibration
 - Instrument description: Camera geometry, telescope layout
 
-Author: Sruthi Ravikularaman
-Last modified: 17 April 2026
+Last modified: 6 May 2026
 """
 
-import logging
+import sys
 
-# Import main classes
-from .eventsource import CalibrationPipeline, PanoEventSource
+# Make submodules accessible
+from . import plugin_src
+from .plugin_src import instrument, eventsource, functions
 
-# Import instrument definitions
-from .instrument import (
+# Register submodules in sys.modules so "from panoseti_ctapipe_plugin.instrument import ..." works
+sys.modules['panoseti_ctapipe_plugin.instrument'] = instrument
+sys.modules['panoseti_ctapipe_plugin.eventsource'] = eventsource
+sys.modules['panoseti_ctapipe_plugin.functions'] = functions
+
+# Import from plugin_src
+from .plugin_src import (
+    PanoEventSource,
     camera,
+    correct_gain,
+    correct_telescope_timing,
+    filter_packet_loss,
+    filter_rate_spikes,
+    geometry,
     optics,
     subarray,
     telescope_1,
@@ -29,12 +39,6 @@ from .instrument import (
     telescope_3,
     telescope_4,
     MODULE_TO_TEL_ID,
-)
-
-# Import utility functions
-from .functions import (
-    apply_gain_correction,
-    apply_rate_spike_filter,
     calculate_pedestal_and_pedvar_robust,
     calibrate_image,
     load_gain_file,
@@ -43,11 +47,15 @@ from .functions import (
 )
 
 __all__ = [
+    # Submodules
+    "instrument",
+    "eventsource",
+    "functions",
     # Main classes
-    "CalibrationPipeline",
     "PanoEventSource",
     # Instrument
     "camera",
+    "geometry",
     "optics",
     "subarray",
     "telescope_1",
@@ -55,20 +63,16 @@ __all__ = [
     "telescope_3",
     "telescope_4",
     "MODULE_TO_TEL_ID",
-    # Calibration functions
-    "apply_gain_correction",
-    "calibrate_image",
-    "subtract_pedestal",
-    # Rate spike filtering
-    "apply_rate_spike_filter",
     # Utility functions
+    "correct_gain",
+    "correct_telescope_timing",
+    "filter_packet_loss",
+    "filter_rate_spikes",
     "calculate_pedestal_and_pedvar_robust",
+    "calibrate_image",
     "load_gain_file",
+    "subtract_pedestal",
     "wr_to_unix",
 ]
-
-# Configure logging
-logger = logging.getLogger(__name__)
-logger.addHandler(logging.NullHandler())
 
 __version__ = "0.1.0"

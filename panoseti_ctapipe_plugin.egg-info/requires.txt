@@ -1,4 +1,0 @@
-ctapipe
-numpy
-astropy
-pypff

@@ -3,7 +3,6 @@ Instrument description for PANOSETI telescopes.
 
 Defines camera geometry, optics, telescope descriptions, and subarray layout.
 
-Author: Sruthi Ravikularaman
 Last modified: 17 April 2026
 """
 
@@ -120,7 +119,7 @@ geometry.frame = CameraFrame(focal_length=optics.effective_focal_length)
 telescope_1 = TelescopeDescription(name="Gattini", optics=optics, camera=camera)
 telescope_2 = TelescopeDescription(name="Winter", optics=optics, camera=camera)
 telescope_3 = TelescopeDescription(name="Fern", optics=optics, camera=camera)
-telescope_4 = TelescopeDescription(name="PTI-Heli", optics=optics, camera=camera)
+telescope_4 = TelescopeDescription(name="PTI", optics=optics, camera=camera)
 
 # Subarray description with telescope positions at Palomar Observatory
 subarray = SubarrayDescription(
@@ -135,7 +134,7 @@ subarray = SubarrayDescription(
         1: [177.58, -333.33, 42.82] * u.m,   # Gattini (CORSIKA coordinates)
         2: [-220.15, 33.67, 49.17] * u.m,    # Winter (CORSIKA coordinates)
         3: [-130.43, 190.40, 34.66] * u.m,   # Fern (CORSIKA coordinates)
-        4: [-1.0, 97.18, 39.70] * u.m,       # PTI-Heli (CORSIKA coordinates)
+        4: [-1.0, 97.18, 39.70] * u.m,       # PTI (CORSIKA coordinates)
     },
     reference_location=EarthLocation(
         lat=33.3564 * u.deg,
@@ -149,5 +148,5 @@ MODULE_TO_TEL_ID = {
     254: 1,  # Gattini
     253: 2,  # Winter
     252: 3,  # Fern
-    250: 4,  # PTI-Heli
+    250: 4,  # PTI
 }

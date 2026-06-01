@@ -115,9 +115,9 @@ def test_telescope_3_config():
 
 
 def test_telescope_4_config():
-    """Test telescope 4 (PTI-Heli) configuration."""
+    """Test telescope 4 (PTI) configuration."""
     assert telescope_4 is not None
-    assert telescope_4.name == "PTI-Heli"
+    assert telescope_4.name == "PTI"
     assert telescope_4.camera is camera
     assert telescope_4.optics is optics
 
@@ -202,7 +202,7 @@ def test_mapping_modules():
     assert MODULE_TO_TEL_ID[254] == 1  # Gattini
     assert MODULE_TO_TEL_ID[253] == 2  # Winter
     assert MODULE_TO_TEL_ID[252] == 3  # Fern
-    assert MODULE_TO_TEL_ID[250] == 4  # PTI-Heli
+    assert MODULE_TO_TEL_ID[250] == 4  # PTI
 
 
 def test_mapping_is_consistent():

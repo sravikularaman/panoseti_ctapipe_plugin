@@ -13,7 +13,15 @@ Last modified: 17 April 2026
 import sys
 from pathlib import Path
 
-test_folder = "/Users/ravikularaman/VScode/panoseti_ctapipe_plugin/test_data/pff/obs_Palomar.start_2026-01-15T02:26:39Z.runtype_obs-test.pffd/obs_Palomar.start_2026-01-15T02:26:39Z.runtype_obs-test.pffd"
+import pytest
+
+test_folder = (
+    Path(__file__).parent.parent
+    / "test_data"
+    / "pff"
+    / "obs_Palomar.start_2026-01-15T02:26:39Z.runtype_obs-test.pffd"
+    / "obs_Palomar.start_2026-01-15T02:26:39Z.runtype_obs-test.pffd"
+)
 
 def test_basic():
     from panoseti_ctapipe_plugin import PanoEventSource

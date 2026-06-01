@@ -8,14 +8,26 @@ dependencies = [
 	"numpy",
 	"astropy",
 	"pypff",
+	"pandas",
 ]
 
 [build-system]
-requires = ["setuptools >= 61.0.0"]
+requires = ["setuptools >= 61.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools.packages]
-find = {}
+[tool.setuptools]
+packages = [
+	"panoseti_ctapipe_plugin",
+	"panoseti_ctapipe_plugin.plugin_src",
+	"panoseti_ctapipe_plugin.utils",
+]
+include-package-data = true
+
+[tool.setuptools.package-dir]
+panoseti_ctapipe_plugin = "."
+
+[tool.setuptools.package-data]
+panoseti_ctapipe_plugin = ["default_data/*.csv"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -18,4 +18,16 @@ dist/
 /auto_examples_Jupyter/
 /pypff/
 *.ipynb
+/exports/
+/notebooks/
+.conda/
+.vscode/
+/PANOSETI-High-Energy-Analysis-Pipeline/
+conftest.py
+environment.yml
+*.C
+pytest.ini
+run_tests.sh
+
+
 
